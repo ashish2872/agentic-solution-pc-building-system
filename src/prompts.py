@@ -1,15 +1,39 @@
 REQUIREMENT_GATHERING_PROMPT = """
-You are the Requirement Analysis module of an Advanced Agentic PC Builder system.
-Your job is to parse the user's raw conversational input and map it into a structured schema.
+You are a friendly PC building assistant gathering requirements from a user.
 
-Analyze the user's text carefully against these rules:
-1. Extract maximum budget, main application focus (Gaming, Productivity, etc.), and hardware/brand preferences.
-2. Check for Ambiguity: If they don't provide BOTH a rough budget (or tier) and a primary use case, mark `is_ambiguous` as True.
-3. Check for Conflicts: If their performance expectations completely mismatch their budget constraint (e.g., high-end video editing or heavy machine learning for under $500), mark `is_conflicting` as True.
-4. Craft a tailored clarification message if `is_ambiguous` or `is_conflicting` is True, politely explaining the mismatch or asking for specific parameters.
+Here is the conversation so far:
+{chat_history}
 
-Maintain an objective, technical, and helpful engineering persona.
+Here are the requirements already collected:
+{current_requirements}
+
+The user's latest message is:
+{user_input}
+
+Your job:
+1. Extract any NEW information from the latest message and merge it with current requirements.
+2. NEVER ask for information that is already present in current_requirements or chat_history.
+3. If the user is relaxing or changing a constraint (e.g. "I'm relaxing the Ryzen preference"),
+   update that specific field — do not discard other collected fields.
+4. If all required fields (budget, primary_use) are collected, set "is_complete": true.
+5. If something is still missing, ask ONLY for that specific missing piece.
+
+Required fields: budget, primary_use
+Optional fields: preferences (brand, CPU type, etc.), constraints
+
+Return a JSON object:
+{{
+  "budget": <number or null>,
+  "primary_use": <string or null>,
+  "preferences": <list of strings>,
+  "constraints": <list of strings>,
+  "is_complete": <true or false>,
+  "is_ambiguous": <true or false>,
+  "is_conflicting": <true or false>,
+  "clarification_message": <string or null>
+}}
 """
+
 
 SQL_GENERATION_PROMPT = """
 
@@ -37,10 +61,41 @@ Rules you MUST follow:
    - CPU: 20%, GPU: 35%, Motherboard: 10%, RAM: 10%, Storage: 10%, PSU: 8%, Case: 7%
 4. Always use ORDER BY price DESC and LIMIT 3 to return the best options within range.
 5. Query ONE component at a time. Return a separate SQL query for each missing component.
-6. If a component is already filled in current_build, skip querying for it.
+6. If a component is already filled in current_build AND has no critique issues, skip querying for it.
 7. Always return your response as a JSON array of objects, each with:
    - "component": the part type (e.g., "cpu", "gpu", "ram")
    - "sql": the SQL query string to fetch candidates for that component
+8. COMPATIBILITY DEPENDENCY ORDER — always query in this sequence:
+   CPU first → Motherboard second (must match CPU socket) → RAM third (must match motherboard memory type) 
+   → GPU → Storage → PSU → Case
+   
+9. CROSS-COMPONENT CONSTRAINTS — after selecting CPU, extract its socket and filter motherboard queries:
+   - If current_build contains a CPU with socket X, add: WHERE socket = 'X' to the motherboard query
+   - If current_build contains a motherboard with memory type Y, add: WHERE memory_type = 'Y' to the RAM query
+   - If current_build contains a GPU with TDP Z, ensure PSU query adds: WHERE wattage >= (Z + 150)
+   - Never query a component independently if a compatibility constraint from a prior component applies
+10. When critique_feedback is non-empty and contains a socket or memory mismatch:
+    - Extract the CORRECT socket/type from the already-confirmed compatible component in current_build
+    - Use that value as a hard WHERE filter on the replacement component query
+    - Example: CPU is LGA1700 → motherboard query MUST include WHERE socket = 'LGA1700'
+...existing example output...
+
+Here is feedback from the previous compatibility check (empty on first pass):
+{critique_feedback}
+
+If critique_feedback is non-empty, it contains specific issues found with the previous build
+(e.g. "CPU socket AM4 does not match motherboard socket LGA1700", "PSU wattage too low for selected GPU").
+You MUST address these issues in your queries:
+- Exclude the previously selected incompatible component by name using WHERE name != '...'
+- Filter for components that resolve the conflict (e.g. matching socket, higher wattage)
+- Do NOT re-query components that are already compatible and present in current_build
+
+Explicit compatibility constraints derived from already-selected components:
+{compatibility_constraints}
+
+These override budget-based filtering — a compatible component at a slightly 
+higher price is always preferred over an incompatible one at a lower price.
+
 
 Example output:
 [
@@ -48,64 +103,68 @@ Example output:
   {{"component": "gpu", "sql": "SELECT * FROM gpus WHERE price < 500 ORDER BY price DESC LIMIT 3"}}
 ]
 """
-
 COMPONENT_SELECTION_PROMPT = """
-You are an expert PC hardware specialist. 
-Given the following database query results for each component, 
-select the single best option for each component type that:
-1. Fits within the allocated budget slice.
-2. Best matches the user's primary use case: {primary_use}
-3. Matches any stated brand or form factor preferences: {preferences}
+You are a PC hardware expert selecting the best components from query results.
 
-Query results per component:
-{query_results}
+Primary use: {primary_use}
+User preferences: {preferences}
+Query results: {query_results}
+Current build so far: {current_build}
 
-Return a JSON object with this exact structure for each component found:
-{{
-  "cpu": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "gpu": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "ram": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "motherboard": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "storage": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "psu": {{"name": "...", "price": 0.0, "specifications": "..."}},
-  "case": {{"name": "...", "price": 0.0, "specifications": "..."}}
-}}
-Only include components for which results were provided. Leave others as null.
+SELECTION RULES — follow in strict order:
+
+1. COMPATIBILITY FIRST — before selecting any component, verify it is compatible
+   with already-selected components in current_build:
+   - CPU socket MUST match motherboard socket exactly
+   - RAM memory type MUST match motherboard supported memory type
+   - PSU wattage MUST be at least (CPU TDP + GPU TDP + 100W overhead)
+   - Case form factor MUST support the motherboard form factor
+
+2. If NO compatible option exists in the query results for a component,
+   leave it as null — do NOT select an incompatible one.
+
+3. SELECTION PRIORITY (after compatibility is confirmed):
+   - Best performance for {primary_use} within budget
+   - Honor user preferences: {preferences}
+   - Value for money
+
+4. Always include socket, memory_type, and wattage fields where applicable —
+   these are used by the compatibility checker downstream.
 """
+
+
 SELF_CRITIQUE_PROMPT = """
-You are a strict PC hardware compatibility expert reviewing a proposed PC build.
+You are a PC hardware compatibility expert performing a final review of an assembled build.
 
-Analyze the following build and check for these compatibility issues:
-
-1. **CPU ↔ Motherboard Socket Match**
-   - Intel CPUs (LGA1200, LGA1700, etc.) must match the motherboard socket.
-   - AMD CPUs (AM4, AM5, etc.) must match the motherboard socket.
-
-2. **PSU Wattage Sufficiency**
-   - Total system TDP (CPU TDP + GPU TDP + ~50W for other components) must not exceed PSU wattage.
-   - A 10-15% headroom is recommended (e.g., 500W system needs at least 550W PSU).
-
-3. **RAM Compatibility**
-   - DDR4 vs DDR5 must match what the motherboard supports.
-   - RAM speed should be within the motherboard's supported range.
-
-4. **Form Factor Match**
-   - Case must support the motherboard form factor (ATX, Micro-ATX, Mini-ITX).
-
-5. **Budget Check**
-   - Total price must not exceed the user's budget of {budget}.
-
-Here is the current build:
+Here is the build to review:
 {build}
 
-Respond with a JSON object in this exact format:
+User's budget: {budget}
+
+Check ALL of the following compatibility rules:
+1. CPU socket MUST match motherboard socket exactly
+   (e.g. AM4 ↔ AM4, LGA1700 ↔ LGA1700 — no mixing)
+2. RAM memory type MUST match motherboard supported memory
+   (DDR4 motherboard → DDR4 RAM only, DDR5 motherboard → DDR5 RAM only)
+3. PSU wattage MUST cover CPU TDP + GPU TDP + at least 100W overhead
+4. Case form factor MUST support the motherboard form factor
+   (ATX case → supports ATX/mATX/ITX; mATX case → mATX/ITX only)
+5. Total price MUST not exceed the user's budget by more than 5%
+
+For each issue found, state:
+- Which two components conflict
+- What the specific mismatch is (e.g. "CPU socket AM5 vs motherboard socket LGA1700")
+- Whether it requires a component swap (needs_requery: true) or is a minor note (needs_requery: false)
+
+Return ONLY a JSON object in this exact format:
 {{
   "is_compatible": true or false,
-  "compatibility_notes": "Detailed explanation of what is compatible and what is not. If incompatible, explain exactly what needs to change.",
-  "issues_found": ["list", "of", "specific", "issues"],
+  "compatibility_notes": "brief summary of overall verdict",
+  "issues_found": ["issue 1", "issue 2"],
   "needs_requery": true or false
 }}
 
-Set "needs_requery" to true ONLY if there are hard incompatibilities (socket mismatch, wrong RAM type, case too small).
-Set "needs_requery" to false if issues are minor (slight budget overrun, PSU headroom is tight but acceptable).
+Set needs_requery to true only when there is a hard incompatibility 
+(socket mismatch, memory type mismatch, PSU too weak).
+Set needs_requery to false for minor issues (slightly over budget, aesthetic mismatch).
 """
