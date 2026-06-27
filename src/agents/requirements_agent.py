@@ -7,6 +7,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END
 
+import re
+from src.logging_utils import attach_log
+
 from src.state import AgentState
 from src.prompts import REQUIREMENT_GATHERING_PROMPT
 
@@ -28,6 +31,32 @@ def get_llm() -> ChatOpenAI:
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 EXIT_PHRASES = {"exit", "quit", "bye", "goodbye", "stop", "end", "i want to exit"}
+
+
+
+
+def _parse_budget_to_number(value):
+    """Convert various user budget strings into a float, or return None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    s = str(value).strip()
+    # Remove common currency symbols and words
+    s = s.replace(",", "")
+    s = re.sub(r"(?i)\b(usd|us\$|dollars|rs|inr)\b", "", s)
+    s = re.sub(r"[^\d\.]", "", s)  # keep digits and dot
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
 
 def format_chat_history(chat_history: list) -> str:
     """Converts chat history list into a readable string for prompt injection."""
@@ -70,17 +99,20 @@ def requirement_gathering_node(state: AgentState) -> dict:
         }
 
     # ── LLM call ──────────────────────────────────────────────────────────
+    print("Building prompt for the requirment gathering")
     gather_prompt = ChatPromptTemplate.from_messages([
         ("system", REQUIREMENT_GATHERING_PROMPT),
         ("user", "Extract and update requirements now.")
     ])
 
     try:
+        print("Calling the LLM to gather requirements...")
         response = (gather_prompt | get_llm()).invoke({
             "chat_history": format_chat_history(chat_history),
             "current_requirements": str(current_requirements),
             "user_input": user_input
         })
+        print(f"LLM response: {response.content}")
     except Exception as e:
         return {
             "next_step": "respond_to_user",
@@ -104,6 +136,34 @@ def requirement_gathering_node(state: AgentState) -> dict:
         **current_requirements,
         **{k: v for k, v in new_requirements.items() if v is not None and v != [] and v != ""}
     }
+
+    if "budget" in merged:
+        parsed_budget = _parse_budget_to_number(merged.get("budget"))
+        if parsed_budget is not None:
+            merged["budget"] = parsed_budget
+        else:
+            # keep original but mark ambiguous so the agent will clarify
+            merged["is_ambiguous"] = True
+    # Compute completeness programmatically: require budget (numeric) and primary_use
+    has_budget = isinstance(merged.get("budget"), (int, float)) and merged.get("budget") > 0
+    has_primary_use = bool(merged.get("primary_use"))
+    merged["is_complete"] = bool(has_budget and has_primary_use)
+    # Ensure flags exist
+    merged.setdefault("is_ambiguous", False)
+    merged.setdefault("is_conflicting", False)
+    merged.setdefault("preferences", merged.get("preferences") or [])
+    merged.setdefault("constraints", merged.get("constraints") or [])
+    merged.setdefault("clarification_message", merged.get("clarification_message"))
+    # If computed incomplete, create a focused clarification message
+    if not merged["is_complete"]:
+        missing = []
+        if not has_budget:
+            missing.append("budget")
+        if not has_primary_use:
+            missing.append("primary use (e.g., gaming, office, video editing)")
+        merged["clarification_message"] = f"Could you provide the following missing information: {', '.join(missing)}?"
+    # Log the merged requirements for traceability
+    attach_log(state, "requirements_agent", "Merged requirements after normalization", meta={"merged": merged})
 
     print(f"-> Merged requirements: {merged}")
     is_complete = merged.get("is_complete", False)
