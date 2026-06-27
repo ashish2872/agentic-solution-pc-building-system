@@ -1,6 +1,44 @@
 # agentic-solution-pc-building-system
 Agentic Solution that helps users build PC based on the user requirements. 
 
+Architecture Diagram : 
+graph TD
+    %% Nodes
+    Entry((Entry Point))
+    GR[Requirements Agent]
+    Sup[Supervisor]
+    QA[Query Agent]
+    CA[Critique Agent]
+    RA[Response Agent]
+    End((END))
+
+    %% Connections
+    Entry --> GR
+    GR --> Sup
+    Sup -- complete --> QA
+    Sup -- incomplete --> RA
+    
+    QA --> Sup
+    QA --> CA
+    
+    CA --> Sup
+    
+    Sup -- needs_requery --> QA
+    Sup -- compatible --> RA
+    
+    RA --> End
+    RA -- awaiting_user --> End
+
+    %% Styling
+    style Entry fill:#f9f,stroke:#333,stroke-width:2px
+    style Sup fill:#ffcc99,stroke:#333,stroke-width:2px
+    style End fill:#99ff99,stroke:#333,stroke-width:2px
+    style GR fill:#d4e1f5,stroke:#333
+    style QA fill:#d4e1f5,stroke:#333
+    style CA fill:#d4e1f5,stroke:#333
+    style RA fill:#d4e1f5,stroke:#333
+
+
 1.	Clone the repository:
 
 git clone https://github.com/ashish2872/agentic-solution-pc-building-system
